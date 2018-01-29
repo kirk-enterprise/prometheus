@@ -19,6 +19,7 @@ import (
 	"strconv"
 
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/util/strutil"
 
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
@@ -34,14 +35,16 @@ type Endpoints struct {
 	endpointsInf cache.SharedInformer
 	serviceInf   cache.SharedInformer
 	podInf       cache.SharedInformer
+	nodeInf      cache.SharedInformer
 
 	podStore       cache.Store
+	nodeStore      cache.Store
 	endpointsStore cache.Store
 	serviceStore   cache.Store
 }
 
 // NewEndpoints returns a new endpoints discovery.
-func NewEndpoints(l log.Logger, svc, eps, pod cache.SharedInformer) *Endpoints {
+func NewEndpoints(l log.Logger, svc, eps, pod, node cache.SharedInformer) *Endpoints {
 	ep := &Endpoints{
 		logger:         l,
 		endpointsInf:   eps,
@@ -50,6 +53,8 @@ func NewEndpoints(l log.Logger, svc, eps, pod cache.SharedInformer) *Endpoints {
 		serviceStore:   svc.GetStore(),
 		podInf:         pod,
 		podStore:       pod.GetStore(),
+		nodeInf:        node,
+		nodeStore:      node.GetStore(),
 	}
 
 	return ep
@@ -211,42 +216,70 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *config.TargetGroup {
 			endpointReadyLabel:        lv(ready),
 		}
 
-		pod := e.resolvePodRef(addr.TargetRef)
-		if pod == nil {
-			// This target is not a Pod, so don't continue with Pod specific logic.
+		if addr.TargetRef == nil {
 			tg.Targets = append(tg.Targets, target)
 			return
 		}
-		s := pod.Namespace + "/" + pod.Name
 
-		sp, ok := seenPods[s]
-		if !ok {
-			sp = &podEntry{pod: pod}
-			seenPods[s] = sp
-		}
+		switch addr.TargetRef.Kind {
+		case "Pod":
+			pod := e.resolvePodRef(addr.TargetRef)
+			if pod == nil {
+				// This target is not a Pod, so don't continue with Pod specific logic.
+				tg.Targets = append(tg.Targets, target)
+				return
+			}
+			s := pod.Namespace + "/" + pod.Name
 
-		// Attach standard pod labels.
-		target = target.Merge(podLabels(pod))
+			sp, ok := seenPods[s]
+			if !ok {
+				sp = &podEntry{pod: pod}
+				seenPods[s] = sp
+			}
 
-		// Attach potential container port labels matching the endpoint port.
-		for _, c := range pod.Spec.Containers {
-			for _, cport := range c.Ports {
-				if port.Port == cport.ContainerPort {
-					ports := strconv.FormatUint(uint64(port.Port), 10)
+			// Attach standard pod labels.
+			target = target.Merge(podLabels(pod))
 
-					target[podContainerNameLabel] = lv(c.Name)
-					target[podContainerPortNameLabel] = lv(cport.Name)
-					target[podContainerPortNumberLabel] = lv(ports)
-					target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
-					break
+			// Attach potential container port labels matching the endpoint port.
+			for _, c := range pod.Spec.Containers {
+				for _, cport := range c.Ports {
+					if port.Port == cport.ContainerPort {
+						ports := strconv.FormatUint(uint64(port.Port), 10)
+
+						target[podContainerNameLabel] = lv(c.Name)
+						target[podContainerPortNameLabel] = lv(cport.Name)
+						target[podContainerPortNumberLabel] = lv(ports)
+						target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
+						break
+					}
 				}
 			}
-		}
 
-		// Add service port so we know that we have already generated a target
-		// for it.
-		sp.servicePorts = append(sp.servicePorts, port)
-		tg.Targets = append(tg.Targets, target)
+			// Add service port so we know that we have already generated a target
+			// for it.
+			sp.servicePorts = append(sp.servicePorts, port)
+			tg.Targets = append(tg.Targets, target)
+		case "Node":
+			node := e.resolveNodeRef(addr.TargetRef)
+			if node == nil {
+				// This target is not a Node, so don't continue with Node specific logic.
+				tg.Targets = append(tg.Targets, target)
+				return
+			}
+			// Attach standard node labels.
+			target = target.Merge(nodeLabels(node))
+			// Attach addresss labels.
+			_, addrMap, err := nodeAddress(node)
+			if err == nil {
+				for ty, a := range addrMap {
+					ln := strutil.SanitizeLabelName(nodeAddressPrefix + string(ty))
+					target[model.LabelName(ln)] = lv(a[0])
+				}
+			}
+			tg.Targets = append(tg.Targets, target)
+		default:
+			tg.Targets = append(tg.Targets, target)
+		}
 	}
 
 	for _, ss := range eps.Subsets {
@@ -295,6 +328,23 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *config.TargetGroup {
 	}
 
 	return tg
+}
+
+func (e *Endpoints) resolveNodeRef(ref *apiv1.ObjectReference) *apiv1.Node {
+	if ref == nil || ref.Kind != "Node" {
+		return nil
+	}
+	p := &apiv1.Node{}
+	p.Name = ref.Name
+
+	obj, exists, err := e.nodeStore.Get(p)
+	if err != nil || !exists {
+		return nil
+	}
+	if err != nil {
+		e.logger.With("err", err).Errorln("resolving node ref failed")
+	}
+	return obj.(*apiv1.Node)
 }
 
 func (e *Endpoints) resolvePodRef(ref *apiv1.ObjectReference) *apiv1.Pod {
