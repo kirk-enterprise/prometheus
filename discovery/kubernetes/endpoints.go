@@ -26,6 +26,7 @@ import (
 	"github.com/prometheus/prometheus/util/strutil"
 	apiv1 "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 // Endpoints discovers new endpoint targets.
@@ -41,6 +42,8 @@ type Endpoints struct {
 	nodeStore      cache.Store
 	endpointsStore cache.Store
 	serviceStore   cache.Store
+
+	queue *workqueue.Type
 }
 
 // NewEndpoints returns a new endpoints discovery.
@@ -48,7 +51,7 @@ func NewEndpoints(l log.Logger, svc, eps, pod, node cache.SharedInformer) *Endpo
 	if l == nil {
 		l = log.NewNopLogger()
 	}
-	ep := &Endpoints{
+	e := &Endpoints{
 		logger:         l,
 		endpointsInf:   eps,
 		endpointsStore: eps.GetStore(),
@@ -58,25 +61,49 @@ func NewEndpoints(l log.Logger, svc, eps, pod, node cache.SharedInformer) *Endpo
 		podStore:       pod.GetStore(),
 		nodeInf:        node,
 		nodeStore:      node.GetStore(),
+		queue:          workqueue.NewNamed("endpoints"),
 	}
 
-	return ep
+	e.endpointsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(o interface{}) {
+			eventCount.WithLabelValues("endpoints", "add").Inc()
+			e.enqueue(o)
+		},
+		UpdateFunc: func(_, o interface{}) {
+			eventCount.WithLabelValues("endpoints", "update").Inc()
+			e.enqueue(o)
+		},
+		DeleteFunc: func(o interface{}) {
+			eventCount.WithLabelValues("endpoints", "delete").Inc()
+			e.enqueue(o)
+		},
+	})
+
+	return e
+}
+
+func (e *Endpoints) enqueue(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return
+	}
+
+	e.queue.Add(key)
 }
 
 // Run implements the Discoverer interface.
 func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
-	// Send full initial set of endpoint targets.
-	var initial []*targetgroup.Group
-
-	for _, o := range e.endpointsStore.List() {
-		tg := e.buildEndpoints(o.(*apiv1.Endpoints))
-		initial = append(initial, tg)
+	cacheSyncs := []cache.InformerSynced{
+		e.endpointsInf.HasSynced,
+		e.serviceInf.HasSynced,
+		e.podInf.HasSynced,
+		e.nodeInf.HasSynced,
 	}
-	select {
-	case <-ctx.Done():
+	if !cache.WaitForCacheSync(ctx.Done(), cacheSyncs...) {
+		level.Error(e.logger).Log("msg", "endpoints informer unable to sync cache")
 		return
-	case ch <- initial:
 	}
+
 	// Send target groups for pod updates.
 	send := func(tg *targetgroup.Group) {
 		if tg == nil {
@@ -89,73 +116,44 @@ func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		}
 	}
 
-	e.endpointsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(o interface{}) {
-			eventCount.WithLabelValues("endpoints", "add").Inc()
+	workFunc := func() bool {
+		keyObj, quit := e.queue.Get()
+		if quit {
+			return true
+		}
+		defer e.queue.Done(keyObj)
+		key := keyObj.(string)
 
-			eps, err := convertToEndpoints(o)
-			if err != nil {
-				level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
-				return
-			}
-			send(e.buildEndpoints(eps))
-		},
-		UpdateFunc: func(_, o interface{}) {
-			eventCount.WithLabelValues("endpoints", "update").Inc()
-
-			eps, err := convertToEndpoints(o)
-			if err != nil {
-				level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
-				return
-			}
-			send(e.buildEndpoints(eps))
-		},
-		DeleteFunc: func(o interface{}) {
-			eventCount.WithLabelValues("endpoints", "delete").Inc()
-
-			eps, err := convertToEndpoints(o)
-			if err != nil {
-				level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
-				return
-			}
-			send(&targetgroup.Group{Source: endpointsSource(eps)})
-		},
-	})
-
-	serviceUpdate := func(o interface{}) {
-		svc, err := convertToService(o)
+		namespace, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
-			level.Error(e.logger).Log("msg", "converting to Service object failed", "err", err)
+			level.Error(e.logger).Log("msg", "spliting key failed", "key", key)
+			return false
+		}
+
+		o, exists, err := e.endpointsStore.GetByKey(key)
+		if err != nil {
+			level.Error(e.logger).Log("msg", "getting object from store failed", "key", key)
+			return false
+		}
+		if !exists {
+			send(&targetgroup.Group{Source: endpointsSourceFromNamespaceAndName(namespace, name)})
+			return false
+		}
+		eps, err := convertToEndpoints(o)
+		if err != nil {
+			level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
+			return false
+		}
+		send(e.buildEndpoints(eps))
+		return false
+	}
+
+	for {
+		quit := workFunc()
+		if quit {
 			return
 		}
-
-		ep := &apiv1.Endpoints{}
-		ep.Namespace = svc.Namespace
-		ep.Name = svc.Name
-		obj, exists, err := e.endpointsStore.Get(ep)
-		if exists && err != nil {
-			send(e.buildEndpoints(obj.(*apiv1.Endpoints)))
-		}
-		if err != nil {
-			level.Error(e.logger).Log("msg", "retrieving endpoints failed", "err", err)
-		}
 	}
-	e.serviceInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		// TODO(fabxc): potentially remove add and delete event handlers. Those should
-		// be triggered via the endpoint handlers already.
-		AddFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "add").Inc()
-			serviceUpdate(o)
-		},
-		UpdateFunc: func(_, o interface{}) {
-			eventCount.WithLabelValues("service", "update").Inc()
-			serviceUpdate(o)
-		},
-		DeleteFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "delete").Inc()
-			serviceUpdate(o)
-		},
-	})
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
@@ -180,6 +178,10 @@ func convertToEndpoints(o interface{}) (*apiv1.Endpoints, error) {
 
 func endpointsSource(ep *apiv1.Endpoints) string {
 	return "endpoints/" + ep.ObjectMeta.Namespace + "/" + ep.ObjectMeta.Name
+}
+
+func endpointsSourceFromNamespaceAndName(namespace, name string) string {
+	return "endpoints/" + namespace + "/" + name
 }
 
 const (
