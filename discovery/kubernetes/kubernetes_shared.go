@@ -18,7 +18,6 @@ import (
 	"sync"
 
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	apiv1 "k8s.io/client-go/pkg/api/v1"
@@ -34,25 +33,26 @@ type KubernetesShared interface {
 type kubernetesShared struct {
 	sync.Mutex
 	client    kubernetes.Interface
-	count     int32
+	count     int64
+	stopCh    <-chan struct{}
 	informers map[string]cache.SharedInformer
 }
 
-func newKubernetesShared(client kubernetes.Interface) *kubernetesShared {
+func newKubernetesShared(client kubernetes.Interface, stopCh <-chan struct{}) *kubernetesShared {
 	return &kubernetesShared{client: client, count: 1, informers: map[string]cache.SharedInformer{}}
 }
 
-func (ks *kubernetesShared) MustGetSharedInformer(resource string, namespace string) cache.SharedInformer {
-	informer, err := ks.GetSharedInformer(resource, namespace)
+func (c *kubernetesShared) MustGetSharedInformer(resource string, namespace string) cache.SharedInformer {
+	informer, err := c.GetSharedInformer(resource, namespace)
 	if err != nil {
 		panic(err)
 	}
 	return informer
 }
 
-func (ks *kubernetesShared) createAndRunSharedInformer(resource string, namespace string) (informer cache.SharedInformer, err error) {
-	rclient := ks.client.CoreV1().RESTClient()
-	reclient := ks.client.ExtensionsV1beta1().RESTClient()
+func (c *kubernetesShared) createAndRunSharedInformer(resource string, namespace string) (informer cache.SharedInformer, err error) {
+	rclient := c.client.CoreV1().RESTClient()
+	reclient := c.client.ExtensionsV1beta1().RESTClient()
 	var lw *cache.ListWatch
 	var obj runtime.Object
 	switch resource {
@@ -76,38 +76,39 @@ func (ks *kubernetesShared) createAndRunSharedInformer(resource string, namespac
 		return
 	}
 	informer = cache.NewSharedInformer(lw, obj, resyncPeriod)
+	go informer.Run(c.stopCh)
 	return
 }
 
-func (ks *kubernetesShared) GetSharedInformer(resource string, namespace string) (informer cache.SharedInformer, err error) {
-	ks.Lock()
-	defer ks.Unlock()
+func (c *kubernetesShared) GetSharedInformer(resource string, namespace string) (informer cache.SharedInformer, err error) {
+	c.Lock()
+	defer c.Unlock()
 	key := fmt.Sprintf("%s/%s", resource, namespace)
-	informer, ok := ks.informers[key]
+	informer, ok := c.informers[key]
 	if !ok {
-		informer, err = ks.createAndRunSharedInformer(resource, namespace)
+		informer, err = c.createAndRunSharedInformer(resource, namespace)
 		if err != nil {
 			return nil, err
 		}
-		ks.informers[key] = informer
+		c.informers[key] = informer
 	}
 	return informer, nil
 }
 
 type KubernetesSharedCache interface {
-	GetOrCreate(key string, create func() (*kubernetesShared, error)) (KubernetesShared, error)
+	GetOrCreate(key string, create func() (kubernetes.Interface, error)) (KubernetesShared, error)
 	Count() int
 	Release(key string)
-	Start(stopCh <-chan struct{})
 }
 
 type kubernetesSharedCache struct {
 	logger log.Logger
 	sync.Mutex
 	shared map[string]*kubernetesShared
+	stopCh <-chan struct{}
 }
 
-func (c *kubernetesSharedCache) GetOrCreate(key string, create func() (*kubernetesShared, error)) (KubernetesShared, error) {
+func (c *kubernetesSharedCache) GetOrCreate(key string, create func() (kubernetes.Interface, error)) (KubernetesShared, error) {
 	c.Lock()
 	defer c.Unlock()
 	shared, ok := c.shared[key]
@@ -118,10 +119,11 @@ func (c *kubernetesSharedCache) GetOrCreate(key string, create func() (*kubernet
 		if create == nil {
 			return nil, fmt.Errorf("create func should not be nil")
 		}
-		shared, err = create()
+		client, err := create()
 		if err != nil {
 			return nil, err
 		}
+		shared = newKubernetesShared(client, c.stopCh)
 		c.shared[key] = shared
 	}
 	return shared, nil
@@ -144,20 +146,10 @@ func (c *kubernetesSharedCache) Count() int {
 	return len(c.shared)
 }
 
-// Start runs all informers. This is called after all discovery instances are
-// configured, no need to lock.
-func (c *kubernetesSharedCache) Start(stopCh <-chan struct{}) {
-	for _, shared := range c.shared {
-		for key, informer := range shared.informers {
-			go informer.Run(stopCh)
-			level.Info(c.logger).Log("msg", "Kubernetes informer started", "key", key)
-		}
-	}
-}
-
-func NewKubernetesSharedCache(l log.Logger) KubernetesSharedCache {
+func NewKubernetesSharedCache(l log.Logger, stopCh <-chan struct{}) KubernetesSharedCache {
 	return &kubernetesSharedCache{
 		logger: l,
+		stopCh: stopCh,
 		shared: make(map[string]*kubernetesShared),
 	}
 }
