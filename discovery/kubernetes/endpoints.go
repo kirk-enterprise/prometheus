@@ -79,6 +79,41 @@ func NewEndpoints(l log.Logger, svc, eps, pod, node cache.SharedInformer) *Endpo
 		},
 	})
 
+	serviceUpdate := func(o interface{}) {
+		svc, err := convertToService(o)
+		if err != nil {
+			level.Error(e.logger).Log("msg", "converting to Service object failed", "err", err)
+			return
+		}
+
+		ep := &apiv1.Endpoints{}
+		ep.Namespace = svc.Namespace
+		ep.Name = svc.Name
+		obj, exists, err := e.endpointsStore.Get(ep)
+		if exists && err != nil {
+			e.enqueue(obj.(*apiv1.Endpoints))
+		}
+		if err != nil {
+			level.Error(e.logger).Log("msg", "retrieving endpoints failed", "err", err)
+		}
+	}
+	e.serviceInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// TODO(fabxc): potentially remove add and delete event handlers. Those should
+		// be triggered via the endpoint handlers already.
+		AddFunc: func(o interface{}) {
+			eventCount.WithLabelValues("service", "add").Inc()
+			serviceUpdate(o)
+		},
+		UpdateFunc: func(_, o interface{}) {
+			eventCount.WithLabelValues("service", "update").Inc()
+			serviceUpdate(o)
+		},
+		DeleteFunc: func(o interface{}) {
+			eventCount.WithLabelValues("service", "delete").Inc()
+			serviceUpdate(o)
+		},
+	})
+
 	return e
 }
 
