@@ -119,11 +119,6 @@ func (m *Manager) ApplyConfig(cfg map[string]sd_config.ServiceDiscoveryConfig) e
 			m.startProvider(m.ctx, poolKey{setName: name, provider: provName}, prov)
 		}
 	}
-	if m.kubeSharedCache != nil {
-		ctx, cancel := context.WithCancel(m.ctx)
-		m.kubeSharedCache.Start(ctx.Done())
-		m.kubeSharedCacheCancel = cancel
-	}
 
 	return nil
 }
@@ -223,7 +218,9 @@ func (m *Manager) providersFromConfig(cfg sd_config.ServiceDiscoveryConfig) map[
 	}
 	if len(cfg.KubernetesSDConfigs) > 0 {
 		if m.kubeSharedCache == nil {
-			m.kubeSharedCache = kubernetes.NewKubernetesSharedCache(m.logger)
+			ctx, cancel := context.WithCancel(m.ctx)
+			m.kubeSharedCache = kubernetes.NewKubernetesSharedCache(m.logger, ctx.Done())
+			m.kubeSharedCacheCancel = cancel
 		}
 		for i, c := range cfg.KubernetesSDConfigs {
 			k, err := kubernetes.New(m.kubeSharedCache, log.With(m.logger, "discovery", "k8s"), c)
