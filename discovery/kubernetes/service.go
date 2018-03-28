@@ -72,6 +72,8 @@ func (e *Service) enqueue(obj interface{}) {
 
 // Run implements the Discoverer interface.
 func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	defer s.queue.ShutDown()
+
 	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
 		level.Error(s.logger).Log("msg", "service informer unable to sync cache")
 		return
@@ -88,39 +90,37 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	workFunc := func() bool {
 		keyObj, quit := s.queue.Get()
 		if quit {
-			return true
+			return false
 		}
 		defer s.queue.Done(keyObj)
 		key := keyObj.(string)
 
 		namespace, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 
 		o, exists, err := s.store.GetByKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 		if !exists {
 			send(&targetgroup.Group{Source: serviceSourceFromNamespaceAndName(namespace, name)})
-			return false
+			return true
 		}
 		eps, err := convertToService(o)
 		if err != nil {
 			level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
-			return false
+			return true
 		}
 		send(s.buildService(eps))
-		return false
+		return true
 	}
 
-	for {
-		quit := workFunc()
-		if quit {
-			return
+	go func() {
+		for workFunc() {
 		}
-	}
+	}()
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()

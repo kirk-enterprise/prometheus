@@ -72,6 +72,8 @@ func (e *Node) enqueue(obj interface{}) {
 
 // Run implements the Discoverer interface.
 func (n *Node) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	defer n.queue.ShutDown()
+
 	if !cache.WaitForCacheSync(ctx.Done(), n.informer.HasSynced) {
 		level.Error(n.logger).Log("msg", "node informer unable to sync cache")
 		return
@@ -90,39 +92,38 @@ func (n *Node) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	workFunc := func() bool {
 		keyObj, quit := n.queue.Get()
 		if quit {
-			return true
+			return false
 		}
 		defer n.queue.Done(keyObj)
 		key := keyObj.(string)
 
 		_, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 
 		o, exists, err := n.store.GetByKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 		if !exists {
 			send(&targetgroup.Group{Source: nodeSourceFromName(name)})
-			return false
+			return true
 		}
 		node, err := convertToNode(o)
 		if err != nil {
 			level.Error(n.logger).Log("msg", "converting to Node object failed", "err", err)
-			return false
+			return true
 		}
 		send(n.buildNode(node))
-		return false
+		return true
 	}
 
-	for {
-		quit := workFunc()
-		if quit {
-			return
+	go func() {
+		for workFunc() {
 		}
-	}
+	}()
+
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
 }

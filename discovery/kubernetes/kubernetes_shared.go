@@ -39,7 +39,7 @@ type kubernetesShared struct {
 }
 
 func newKubernetesShared(client kubernetes.Interface, stopCh <-chan struct{}) *kubernetesShared {
-	return &kubernetesShared{client: client, count: 1, informers: map[string]cache.SharedInformer{}}
+	return &kubernetesShared{client: client, count: 1, stopCh: stopCh, informers: map[string]cache.SharedInformer{}}
 }
 
 func (c *kubernetesShared) MustGetSharedInformer(resource string, namespace string) cache.SharedInformer {
