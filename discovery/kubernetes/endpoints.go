@@ -188,12 +188,10 @@ func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	go func() {
 		for workFunc() {
 		}
-		level.Info(e.logger).Log("msg", "endpoints workfunc exited")
 	}()
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
-	level.Info(e.logger).Log("msg", "endpoints run controller exited")
 }
 
 func convertToEndpoints(o interface{}) (*apiv1.Endpoints, error) {
