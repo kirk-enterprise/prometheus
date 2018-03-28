@@ -128,6 +128,8 @@ func (e *Endpoints) enqueue(obj interface{}) {
 
 // Run implements the Discoverer interface.
 func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	defer e.queue.ShutDown()
+
 	cacheSyncs := []cache.InformerSynced{
 		e.endpointsInf.HasSynced,
 		e.serviceInf.HasSynced,
@@ -154,7 +156,7 @@ func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	workFunc := func() bool {
 		keyObj, quit := e.queue.Get()
 		if quit {
-			return true
+			return false
 		}
 		defer e.queue.Done(keyObj)
 		key := keyObj.(string)
@@ -162,36 +164,36 @@ func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		namespace, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
 			level.Error(e.logger).Log("msg", "spliting key failed", "key", key)
-			return false
+			return true
 		}
 
 		o, exists, err := e.endpointsStore.GetByKey(key)
 		if err != nil {
 			level.Error(e.logger).Log("msg", "getting object from store failed", "key", key)
-			return false
+			return true
 		}
 		if !exists {
 			send(&targetgroup.Group{Source: endpointsSourceFromNamespaceAndName(namespace, name)})
-			return false
+			return true
 		}
 		eps, err := convertToEndpoints(o)
 		if err != nil {
 			level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
-			return false
+			return true
 		}
 		send(e.buildEndpoints(eps))
-		return false
+		return true
 	}
 
-	for {
-		quit := workFunc()
-		if quit {
-			return
+	go func() {
+		for workFunc() {
 		}
-	}
+		level.Info(e.logger).Log("msg", "endpoints workfunc exited")
+	}()
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
+	level.Info(e.logger).Log("msg", "endpoints run controller exited")
 }
 
 func convertToEndpoints(o interface{}) (*apiv1.Endpoints, error) {

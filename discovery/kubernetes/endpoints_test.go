@@ -376,7 +376,7 @@ func TestEndpointsDiscoveryUpdate(t *testing.T) {
 }
 
 func TestEndpointsDiscoveryEmptySubsets(t *testing.T) {
-	n, _, eps, _ := makeTestEndpointsDiscovery()
+	n, _, eps, _, _ := makeTestEndpointsDiscovery()
 	eps.GetStore().Add(makeEndpoints())
 
 	k8sDiscoveryTest{

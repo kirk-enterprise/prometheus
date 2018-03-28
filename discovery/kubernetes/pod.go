@@ -79,6 +79,8 @@ func (e *Pod) enqueue(obj interface{}) {
 
 // Run implements the Discoverer interface.
 func (p *Pod) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	defer p.queue.ShutDown()
+
 	if !cache.WaitForCacheSync(ctx.Done(), p.informer.HasSynced) {
 		level.Error(p.logger).Log("msg", "pod informer unable to sync cache")
 		return
@@ -99,39 +101,37 @@ func (p *Pod) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	workFunc := func() bool {
 		keyObj, quit := p.queue.Get()
 		if quit {
-			return true
+			return false
 		}
 		defer p.queue.Done(keyObj)
 		key := keyObj.(string)
 
 		namespace, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 
 		o, exists, err := p.store.GetByKey(key)
 		if err != nil {
-			return false
+			return true
 		}
 		if !exists {
 			send(&targetgroup.Group{Source: podSourceFromNamespaceAndName(namespace, name)})
-			return false
+			return true
 		}
 		eps, err := convertToPod(o)
 		if err != nil {
 			level.Error(p.logger).Log("msg", "converting to Pod object failed", "err", err)
-			return false
+			return true
 		}
 		send(p.buildPod(eps))
-		return false
+		return true
 	}
 
-	for {
-		quit := workFunc()
-		if quit {
-			return
+	go func() {
+		for workFunc() {
 		}
-	}
+	}()
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
