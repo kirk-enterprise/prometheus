@@ -24,8 +24,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+func serviceStoreKeyFunc(obj interface{}) (string, error) {
+	return obj.(*v1.Service).ObjectMeta.Name, nil
+}
+
 func newFakeServiceInformer() *fakeInformer {
-	return newFakeInformer(cache.DeletionHandlingMetaNamespaceKeyFunc)
+	return newFakeInformer(serviceStoreKeyFunc)
 }
 
 func makeTestServiceDiscovery() (*Service, *fakeInformer) {
@@ -80,6 +84,38 @@ func makeService() *v1.Service {
 	return makeSuffixedService("")
 }
 
+func TestServiceDiscoveryInitial(t *testing.T) {
+	n, i := makeTestServiceDiscovery()
+	i.GetStore().Add(makeMultiPortService())
+
+	k8sDiscoveryTest{
+		discovery: n,
+		expectedInitial: []*targetgroup.Group{
+			{
+				Targets: []model.LabelSet{
+					{
+						"__meta_kubernetes_service_port_protocol": "TCP",
+						"__address__":                             "testservice.default.svc:30900",
+						"__meta_kubernetes_service_port_name":     "testport0",
+					},
+					{
+						"__meta_kubernetes_service_port_protocol": "UDP",
+						"__address__":                             "testservice.default.svc:30901",
+						"__meta_kubernetes_service_port_name":     "testport1",
+					},
+				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_service_name":                      "testservice",
+					"__meta_kubernetes_namespace":                         "default",
+					"__meta_kubernetes_service_label_testlabel":           "testvalue",
+					"__meta_kubernetes_service_annotation_testannotation": "testannotationvalue",
+				},
+				Source: "svc/default/testservice",
+			},
+		},
+	}.Run(t)
+}
+
 func TestServiceDiscoveryAdd(t *testing.T) {
 	n, i := makeTestServiceDiscovery()
 
@@ -112,6 +148,22 @@ func TestServiceDiscoveryDelete(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Delete(makeService()) }() },
+		expectedInitial: []*targetgroup.Group{
+			{
+				Targets: []model.LabelSet{
+					{
+						"__meta_kubernetes_service_port_protocol": "TCP",
+						"__address__":                             "testservice.default.svc:30900",
+						"__meta_kubernetes_service_port_name":     "testport",
+					},
+				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_service_name": "testservice",
+					"__meta_kubernetes_namespace":    "default",
+				},
+				Source: "svc/default/testservice",
+			},
+		},
 		expectedRes: []*targetgroup.Group{
 			{
 				Source: "svc/default/testservice",
@@ -125,16 +177,23 @@ func TestServiceDiscoveryDeleteUnknownCacheState(t *testing.T) {
 	i.GetStore().Add(makeService())
 
 	k8sDiscoveryTest{
-		discovery: n,
-		afterStart: func() {
-			go func() {
-				obj := makeService()
-				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				if err != nil {
-					t.Errorf("failed to get key for %v: %v", obj, err)
-				}
-				i.Delete(cache.DeletedFinalStateUnknown{Key: key, Obj: obj})
-			}()
+		discovery:  n,
+		afterStart: func() { go func() { i.Delete(cache.DeletedFinalStateUnknown{Obj: makeService()}) }() },
+		expectedInitial: []*targetgroup.Group{
+			{
+				Targets: []model.LabelSet{
+					{
+						"__meta_kubernetes_service_port_protocol": "TCP",
+						"__address__":                             "testservice.default.svc:30900",
+						"__meta_kubernetes_service_port_name":     "testport",
+					},
+				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_service_name": "testservice",
+					"__meta_kubernetes_namespace":    "default",
+				},
+				Source: "svc/default/testservice",
+			},
 		},
 		expectedRes: []*targetgroup.Group{
 			{
@@ -151,6 +210,22 @@ func TestServiceDiscoveryUpdate(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Update(makeMultiPortService()) }() },
+		expectedInitial: []*targetgroup.Group{
+			{
+				Targets: []model.LabelSet{
+					{
+						"__meta_kubernetes_service_port_protocol": "TCP",
+						"__address__":                             "testservice.default.svc:30900",
+						"__meta_kubernetes_service_port_name":     "testport",
+					},
+				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_service_name": "testservice",
+					"__meta_kubernetes_namespace":    "default",
+				},
+				Source: "svc/default/testservice",
+			},
+		},
 		expectedRes: []*targetgroup.Group{
 			{
 				Targets: []model.LabelSet{

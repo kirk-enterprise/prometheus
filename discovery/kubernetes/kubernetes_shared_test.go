@@ -18,78 +18,83 @@ import (
 	"testing"
 
 	"github.com/go-kit/kit/log"
-	"k8s.io/client-go/kubernetes"
 )
 
 func TestKubernetesSharedCache(t *testing.T) {
 	{
 		// test GetOrCreate
-		stopCh := make(chan struct{})
-		cache := NewKubernetesSharedCache(log.NewNopLogger(), stopCh)
-		tmpClient := &kubernetes.Clientset{}
+		cache := NewKubernetesSharedCache(log.NewNopLogger())
+		tmpShared := &kubernetesShared{}
 		testcases := []struct {
-			name        string
-			key         string
-			create      func() (kubernetes.Interface, error)
-			expectedErr bool
+			name                     string
+			key                      string
+			create                   func() (*kubernetesShared, error)
+			expectedKubernetesShared KubernetesShared
+			expectedErr              bool
 		}{
 			{
 				name: "create successfully",
 				key:  "test",
-				create: func() (kubernetes.Interface, error) {
-					return tmpClient, nil
+				create: func() (*kubernetesShared, error) {
+					return tmpShared, nil
 				},
-				expectedErr: false,
+				expectedKubernetesShared: tmpShared,
+				expectedErr:              false,
 			},
 			{
 				name: "create failed",
 				key:  "test2",
-				create: func() (kubernetes.Interface, error) {
+				create: func() (*kubernetesShared, error) {
 					return nil, fmt.Errorf("create error")
 				},
-				expectedErr: true,
+				expectedKubernetesShared: nil,
+				expectedErr:              true,
 			},
 		}
 		for _, v := range testcases {
-			_, err := cache.GetOrCreate(v.key, v.create)
+			shared, err := cache.GetOrCreate(v.key, v.create)
 			if v.expectedErr && err == nil {
 				t.Errorf("test %s: err should be non-nil", v.name)
+			}
+			if v.expectedKubernetesShared != shared {
+				t.Errorf("test %s: shared should be %+v, got %+v", v.name, v.expectedKubernetesShared, shared)
 			}
 		}
 	}
 
 	{
 		// test GetOrCreate with same key
-		stopCh := make(chan struct{})
-		cache := NewKubernetesSharedCache(log.NewNopLogger(), stopCh)
-		tmpClient := &kubernetes.Clientset{}
+		cache := NewKubernetesSharedCache(log.NewNopLogger())
+		tmpShared := &kubernetesShared{}
 		count := 0
 		for i := 0; i < 10; i++ {
-			cache.GetOrCreate("test", func() (kubernetes.Interface, error) {
+			cache.GetOrCreate("test", func() (*kubernetesShared, error) {
 				count++
-				return tmpClient, nil
+				return tmpShared, nil
 			})
 		}
 		if count != 1 {
 			t.Errorf("create function for same key should only be called once, called %d times", count)
 		}
 
-		_, err := cache.GetOrCreate("test", nil)
+		shared, err := cache.GetOrCreate("test", nil)
 		if err != nil {
 			t.Errorf("err should be nil, got: %v", err)
+		}
+		if shared != tmpShared {
+			t.Errorf("shared should be %v, got %v", tmpShared, shared)
 		}
 	}
 
 	{
 		// test GetOrCreate then release
-		stopCh := make(chan struct{})
-		cache := NewKubernetesSharedCache(log.NewNopLogger(), stopCh)
-		tmpClient := &kubernetes.Clientset{}
+		cache := NewKubernetesSharedCache(log.NewNopLogger())
+		tmpShared := &kubernetesShared{}
 		if cache.Count() != 0 {
 			t.Errorf("count should be 0 at beginning")
 		}
-		cache.GetOrCreate("test", func() (kubernetes.Interface, error) {
-			return tmpClient, nil
+		cache.GetOrCreate("test", func() (*kubernetesShared, error) {
+			return tmpShared, nil
 		})
 		if cache.Count() != 1 {
 			t.Errorf("count should be 1, got: %d", cache.Count())

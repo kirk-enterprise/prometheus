@@ -24,7 +24,6 @@ import (
 	"github.com/prometheus/common/model"
 	apiv1 "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
@@ -35,7 +34,6 @@ type Service struct {
 	logger   log.Logger
 	informer cache.SharedInformer
 	store    cache.Store
-	queue    *workqueue.Type
 }
 
 // NewService returns a new service discovery.
@@ -43,40 +41,21 @@ func NewService(l log.Logger, inf cache.SharedInformer) *Service {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
-	s := &Service{logger: l, informer: inf, store: inf.GetStore(), queue: workqueue.NewNamed("ingress")}
-	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "add").Inc()
-			s.enqueue(o)
-		},
-		DeleteFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "delete").Inc()
-			s.enqueue(o)
-		},
-		UpdateFunc: func(_, o interface{}) {
-			eventCount.WithLabelValues("service", "update").Inc()
-			s.enqueue(o)
-		},
-	})
-	return s
-}
-
-func (e *Service) enqueue(obj interface{}) {
-	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-	if err != nil {
-		return
-	}
-
-	e.queue.Add(key)
+	return &Service{logger: l, informer: inf, store: inf.GetStore()}
 }
 
 // Run implements the Discoverer interface.
 func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
-	defer s.queue.ShutDown()
-
-	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
-		level.Error(s.logger).Log("msg", "service informer unable to sync cache")
+	// Send full initial set of pod targets.
+	var initial []*targetgroup.Group
+	for _, o := range s.store.List() {
+		tg := s.buildService(o.(*apiv1.Service))
+		initial = append(initial, tg)
+	}
+	select {
+	case <-ctx.Done():
 		return
+	case ch <- initial:
 	}
 
 	// Send target groups for service updates.
@@ -86,41 +65,38 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		case ch <- []*targetgroup.Group{tg}:
 		}
 	}
+	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(o interface{}) {
+			eventCount.WithLabelValues("service", "add").Inc()
 
-	workFunc := func() bool {
-		keyObj, quit := s.queue.Get()
-		if quit {
-			return false
-		}
-		defer s.queue.Done(keyObj)
-		key := keyObj.(string)
+			svc, err := convertToService(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
+				return
+			}
+			send(s.buildService(svc))
+		},
+		DeleteFunc: func(o interface{}) {
+			eventCount.WithLabelValues("service", "delete").Inc()
 
-		namespace, name, err := cache.SplitMetaNamespaceKey(key)
-		if err != nil {
-			return true
-		}
+			svc, err := convertToService(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
+				return
+			}
+			send(&targetgroup.Group{Source: serviceSource(svc)})
+		},
+		UpdateFunc: func(_, o interface{}) {
+			eventCount.WithLabelValues("service", "update").Inc()
 
-		o, exists, err := s.store.GetByKey(key)
-		if err != nil {
-			return true
-		}
-		if !exists {
-			send(&targetgroup.Group{Source: serviceSourceFromNamespaceAndName(namespace, name)})
-			return true
-		}
-		eps, err := convertToService(o)
-		if err != nil {
-			level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
-			return true
-		}
-		send(s.buildService(eps))
-		return true
-	}
-
-	go func() {
-		for workFunc() {
-		}
-	}()
+			svc, err := convertToService(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
+				return
+			}
+			send(s.buildService(svc))
+		},
+	})
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
@@ -144,10 +120,6 @@ func convertToService(o interface{}) (*apiv1.Service, error) {
 
 func serviceSource(s *apiv1.Service) string {
 	return "svc/" + s.Namespace + "/" + s.Name
-}
-
-func serviceSourceFromNamespaceAndName(namespace, name string) string {
-	return "svc/" + namespace + "/" + name
 }
 
 const (
