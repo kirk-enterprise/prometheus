@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,11 +27,13 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	yaml_util "github.com/prometheus/prometheus/util/yaml"
-	yaml "gopkg.in/yaml.v2"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api"
+	apiv1 "k8s.io/client-go/pkg/api/v1"
+	extensionsv1beta1 "k8s.io/client-go/pkg/apis/extensions/v1beta1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 )
 
 const (
@@ -91,16 +92,6 @@ type SDConfig struct {
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
-}
-
-func (c *SDConfig) uniqueKeyForShare() (string, error) {
-	cfg := *c
-	// unset unnecessary fields
-	cfg.Role = ""
-	cfg.NamespaceDiscovery = NamespaceDiscovery{}
-	cfg.XXX = nil
-	byt, err := yaml.Marshal(cfg)
-	return string(byt), err
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -164,7 +155,7 @@ func init() {
 // Discovery implements the Discoverer interface for discovering
 // targets from Kubernetes.
 type Discovery struct {
-	kubeShared         KubernetesShared
+	client             kubernetes.Interface
 	role               Role
 	logger             log.Logger
 	namespaceDiscovery *NamespaceDiscovery
@@ -178,7 +169,11 @@ func (d *Discovery) getNamespaces() []string {
 	return namespaces
 }
 
-func clientFromConfig(l log.Logger, conf *SDConfig) (kubernetes.Interface, error) {
+// New creates a new Kubernetes discovery for the given role.
+func New(l log.Logger, conf *SDConfig) (*Discovery, error) {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
 	var (
 		kcfg *rest.Config
 		err  error
@@ -233,36 +228,14 @@ func clientFromConfig(l log.Logger, conf *SDConfig) (kubernetes.Interface, error
 		}
 	}
 
-	// Enable timeout to prevent hanging in case of network issues.
-	kcfg.Timeout = clientTimeout
-	// Disable throttling to reduce latency in large cluster.
-	kcfg.QPS = float32(-1)
 	kcfg.UserAgent = "prometheus/discovery"
 
-	return kubernetes.NewForConfig(kcfg)
-}
-
-// New creates a new Kubernetes discovery for the given role.
-func New(kubeSharedCache KubernetesSharedCache, l log.Logger, conf *SDConfig) (*Discovery, error) {
-	if l == nil {
-		l = log.NewNopLogger()
-	}
-	key, err := conf.uniqueKeyForShare()
-	if err != nil {
-		return nil, err
-	}
-	shared, err := kubeSharedCache.GetOrCreate(key, func() (*kubernetesShared, error) {
-		client, err := clientFromConfig(l, conf)
-		if err != nil {
-			return nil, err
-		}
-		return newKubernetesShared(client), nil
-	})
+	c, err := kubernetes.NewForConfig(kcfg)
 	if err != nil {
 		return nil, err
 	}
 	return &Discovery{
-		kubeShared:         shared,
+		client:             c,
 		logger:             l,
 		role:               conf.Role,
 		namespaceDiscovery: &conf.NamespaceDiscovery,
@@ -270,83 +243,131 @@ func New(kubeSharedCache KubernetesSharedCache, l log.Logger, conf *SDConfig) (*
 }
 
 const resyncPeriod = 10 * time.Minute
-const clientTimeout = 10 * time.Minute
 
 // Run implements the Discoverer interface.
 func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	rclient := d.client.Core().RESTClient()
+	reclient := d.client.Extensions().RESTClient()
+
 	namespaces := d.getNamespaces()
 
-	var wg sync.WaitGroup
 	switch d.role {
 	case "endpoints":
+		var wg sync.WaitGroup
+
 		for _, namespace := range namespaces {
+			elw := cache.NewListWatchFromClient(rclient, "endpoints", namespace, nil)
+			slw := cache.NewListWatchFromClient(rclient, "services", namespace, nil)
+			plw := cache.NewListWatchFromClient(rclient, "pods", namespace, nil)
+			nlw := cache.NewListWatchFromClient(rclient, "nodes", api.NamespaceAll, nil)
 			eps := NewEndpoints(
 				log.With(d.logger, "role", "endpoint"),
-				d.kubeShared.MustGetSharedInformer("services", namespace),
-				d.kubeShared.MustGetSharedInformer("endpoints", namespace),
-				d.kubeShared.MustGetSharedInformer("pods", namespace),
-				d.kubeShared.MustGetSharedInformer("nodes", api.NamespaceAll),
+				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
+				cache.NewSharedInformer(elw, &apiv1.Endpoints{}, resyncPeriod),
+				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
+				cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod),
 			)
+			go eps.endpointsInf.Run(ctx.Done())
+			go eps.serviceInf.Run(ctx.Done())
+			go eps.podInf.Run(ctx.Done())
+			go eps.nodeInf.Run(ctx.Done())
+
+			for !eps.serviceInf.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
+			for !eps.endpointsInf.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
+			for !eps.podInf.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
+			for !eps.nodeInf.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				eps.Run(ctx, ch)
 			}()
 		}
+		wg.Wait()
 	case "pod":
+		var wg sync.WaitGroup
 		for _, namespace := range namespaces {
+			plw := cache.NewListWatchFromClient(rclient, "pods", namespace, nil)
 			pod := NewPod(
 				log.With(d.logger, "role", "pod"),
-				d.kubeShared.MustGetSharedInformer("pods", namespace),
+				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
 			)
+			go pod.informer.Run(ctx.Done())
+
+			for !pod.informer.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				pod.Run(ctx, ch)
 			}()
 		}
+		wg.Wait()
 	case "service":
+		var wg sync.WaitGroup
 		for _, namespace := range namespaces {
+			slw := cache.NewListWatchFromClient(rclient, "services", namespace, nil)
 			svc := NewService(
 				log.With(d.logger, "role", "service"),
-				d.kubeShared.MustGetSharedInformer("services", namespace),
+				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
 			)
+			go svc.informer.Run(ctx.Done())
+
+			for !svc.informer.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				svc.Run(ctx, ch)
 			}()
 		}
+		wg.Wait()
 	case "ingress":
+		var wg sync.WaitGroup
 		for _, namespace := range namespaces {
+			ilw := cache.NewListWatchFromClient(reclient, "ingresses", namespace, nil)
 			ingress := NewIngress(
 				log.With(d.logger, "role", "ingress"),
-				d.kubeShared.MustGetSharedInformer("ingresses", namespace),
+				cache.NewSharedInformer(ilw, &extensionsv1beta1.Ingress{}, resyncPeriod),
 			)
+			go ingress.informer.Run(ctx.Done())
+
+			for !ingress.informer.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				ingress.Run(ctx, ch)
 			}()
 		}
+		wg.Wait()
 	case "node":
+		nlw := cache.NewListWatchFromClient(rclient, "nodes", api.NamespaceAll, nil)
 		node := NewNode(
 			log.With(d.logger, "role", "node"),
-			d.kubeShared.MustGetSharedInformer("nodes", api.NamespaceAll),
+			cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod),
 		)
+		go node.informer.Run(ctx.Done())
+
+		for !node.informer.HasSynced() {
+			time.Sleep(100 * time.Millisecond)
+		}
 		node.Run(ctx, ch)
 
 	default:
 		level.Error(d.logger).Log("msg", "unknown Kubernetes discovery kind", "role", d.role)
 	}
 
-	namespacesStr := strings.Join(namespaces, ",")
-	if d.role == "node" {
-		namespacesStr = api.NamespaceAll
-	}
-	level.Info(d.logger).Log("msg", "Discoverying targets", "role", d.role, "namespaces", namespacesStr)
-
-	wg.Wait()
 	<-ctx.Done()
 }
 
