@@ -251,8 +251,12 @@ func New(kubeSharedCache KubernetesSharedCache, l log.Logger, conf *SDConfig) (*
 	if err != nil {
 		return nil, err
 	}
-	shared, err := kubeSharedCache.GetOrCreate(key, func() (kubernetes.Interface, error) {
-		return clientFromConfig(l, conf)
+	shared, err := kubeSharedCache.GetOrCreate(key, func() (*kubernetesShared, error) {
+		client, err := clientFromConfig(l, conf)
+		if err != nil {
+			return nil, err
+		}
+		return newKubernetesShared(client), nil
 	})
 	if err != nil {
 		return nil, err

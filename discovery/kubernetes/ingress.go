@@ -24,7 +24,6 @@ import (
 	"github.com/prometheus/prometheus/util/strutil"
 	"k8s.io/client-go/pkg/apis/extensions/v1beta1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 )
 
 // Ingress implements discovery of Kubernetes ingresss.
@@ -32,45 +31,25 @@ type Ingress struct {
 	logger   log.Logger
 	informer cache.SharedInformer
 	store    cache.Store
-	queue    *workqueue.Type
 }
 
 // NewIngress returns a new ingress discovery.
 func NewIngress(l log.Logger, inf cache.SharedInformer) *Ingress {
-	s := &Ingress{logger: l, informer: inf, store: inf.GetStore(), queue: workqueue.NewNamed("ingress")}
-	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(o interface{}) {
-			eventCount.WithLabelValues("ingress", "add").Inc()
-			s.enqueue(o)
-		},
-		DeleteFunc: func(o interface{}) {
-			eventCount.WithLabelValues("ingress", "delete").Inc()
-			s.enqueue(o)
-		},
-		UpdateFunc: func(_, o interface{}) {
-			eventCount.WithLabelValues("ingress", "update").Inc()
-			s.enqueue(o)
-		},
-	})
-	return s
-}
-
-func (e *Ingress) enqueue(obj interface{}) {
-	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-	if err != nil {
-		return
-	}
-
-	e.queue.Add(key)
+	return &Ingress{logger: l, informer: inf, store: inf.GetStore()}
 }
 
 // Run implements the Discoverer interface.
 func (s *Ingress) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
-	defer s.queue.ShutDown()
-
-	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
-		level.Error(s.logger).Log("msg", "ingress informer unable to sync cache")
+	// Send full initial set of pod targets.
+	var initial []*targetgroup.Group
+	for _, o := range s.store.List() {
+		tg := s.buildIngress(o.(*v1beta1.Ingress))
+		initial = append(initial, tg)
+	}
+	select {
+	case <-ctx.Done():
 		return
+	case ch <- initial:
 	}
 
 	// Send target groups for ingress updates.
@@ -80,41 +59,38 @@ func (s *Ingress) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		case ch <- []*targetgroup.Group{tg}:
 		}
 	}
+	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(o interface{}) {
+			eventCount.WithLabelValues("ingress", "add").Inc()
 
-	workFunc := func() bool {
-		keyObj, quit := s.queue.Get()
-		if quit {
-			return false
-		}
-		defer s.queue.Done(keyObj)
-		key := keyObj.(string)
+			ingress, err := convertToIngress(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Ingress object failed", "err", err.Error())
+				return
+			}
+			send(s.buildIngress(ingress))
+		},
+		DeleteFunc: func(o interface{}) {
+			eventCount.WithLabelValues("ingress", "delete").Inc()
 
-		namespace, name, err := cache.SplitMetaNamespaceKey(key)
-		if err != nil {
-			return true
-		}
+			ingress, err := convertToIngress(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Ingress object failed", "err", err.Error())
+				return
+			}
+			send(&targetgroup.Group{Source: ingressSource(ingress)})
+		},
+		UpdateFunc: func(_, o interface{}) {
+			eventCount.WithLabelValues("ingress", "update").Inc()
 
-		o, exists, err := s.store.GetByKey(key)
-		if err != nil {
-			return true
-		}
-		if !exists {
-			send(&targetgroup.Group{Source: ingressSourceFromNamespaceAndName(namespace, name)})
-			return true
-		}
-		eps, err := convertToIngress(o)
-		if err != nil {
-			level.Error(s.logger).Log("msg", "converting to Ingress object failed", "err", err)
-			return true
-		}
-		send(s.buildIngress(eps))
-		return true
-	}
-
-	go func() {
-		for workFunc() {
-		}
-	}()
+			ingress, err := convertToIngress(o)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "converting to Ingress object failed", "err", err.Error())
+				return
+			}
+			send(s.buildIngress(ingress))
+		},
+	})
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
@@ -139,10 +115,6 @@ func convertToIngress(o interface{}) (*v1beta1.Ingress, error) {
 
 func ingressSource(s *v1beta1.Ingress) string {
 	return "ingress/" + s.Namespace + "/" + s.Name
-}
-
-func ingressSourceFromNamespaceAndName(namespace, name string) string {
-	return "ingress/" + namespace + "/" + name
 }
 
 const (
